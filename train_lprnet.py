@@ -1,10 +1,10 @@
 """
 ==============================================================================
 Script Huấn luyện LPRNet + STN (End-to-End với PyTorch CTC Loss)
-- Tự động nạp dữ liệu từ data_source/dataset_ocr (10.000 train + 1.500 val).
-- Huấn luyện đồng thời SpatialTransformer (nắn thẳng) và LPRNet (đọc ký tự).
-- Sử dụng hàm mất mát Connectionist Temporal Classification (CTCLoss).
-- Tự động lưu trọng số tốt nhất (best.pt), lịch sử (history.csv) và báo cáo độ chính xác.
+HỖ TRỢ CẢ 3 CHẾ ĐỘ:
+1. Huấn luyện Bounded STN từ đầu (Scratch)
+2. Huấn luyện Two-Stage Warmup (Đóng băng STN pha 1)
+3. Huấn luyện Tinh chỉnh (Fine-tuning) trộn dữ liệu cũ (dataset_ocr) + dữ liệu mới (real_cropped_plates)
 ==============================================================================
 """
 
@@ -24,30 +24,32 @@ from model_stn_lprnet import STN_LPRNet, CHARS, CHAR2IDX, ctc_decode
 
 
 # ==============================================================================
-# 1. DATASET & DATALOADER CHO LPRNET
+# 1. DATASET & DATALOADER CHO LPRNET (HỖ TRỢ TRỘN MULTI-SOURCE DATA)
 # ==============================================================================
 class LPRDataset(Dataset):
     """
     Dataset đọc ảnh biển số và nhãn text từ file txt:
     Tối ưu hóa In-Memory Caching: Tải toàn bộ ảnh vào RAM (~70MB) giúp tăng tốc 10x trên CPU.
     """
-    def __init__(self, txt_path, img_dir, target_size=(94, 24), preload=True):
+    def __init__(self, txt_path, img_dir, extra_samples=None, target_size=(94, 24), preload=True):
         self.img_dir = Path(img_dir)
         self.target_w, self.target_h = target_size
         self.samples = []
         self.preload = preload
 
-        if not Path(txt_path).exists():
-            raise FileNotFoundError(f"Không tìm thấy file nhãn: {txt_path}")
+        if Path(txt_path).exists():
+            with open(txt_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        img_name, raw_label = parts[0], parts[1].upper()
+                        img_path = self.img_dir / img_name
+                        if img_path.exists():
+                            self.samples.append((img_path, raw_label))
 
-        with open(txt_path, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    img_name, raw_label = parts[0], parts[1].upper()
-                    img_path = self.img_dir / img_name
-                    if img_path.exists():
-                        self.samples.append((img_path, raw_label))
+        # Trộn thêm dữ liệu thực tế (nếu có)
+        if extra_samples:
+            self.samples.extend(extra_samples)
 
         self.cached_data = []
         if self.preload and self.samples:
@@ -85,68 +87,27 @@ class LPRDataset(Dataset):
 
 
 def lpr_collate_fn(batch):
-    """
-    Gộp batch cho PyTorch CTCLoss:
-    - imgs: Tensor 4D (Batch_Size, 3, 24, 94)
-    - targets: Tensor 1D ghép nối toàn bộ nhãn của cả batch
-    - target_lengths: Độ dài chuỗi của từng ảnh trong batch
-    - raw_texts: Danh sách chuỗi text gốc để đánh giá Accuracy
-    """
-    imgs, label_tensors, raw_texts = zip(*batch)
-    imgs = torch.stack(imgs, 0)
+    images = []
+    labels = []
+    lengths = []
+    raw_texts = []
 
-    target_lengths = torch.tensor([len(t) for t in label_tensors], dtype=torch.long)
-    targets = torch.cat(label_tensors) if len(label_tensors) > 0 else torch.empty(0, dtype=torch.long)
+    for img_tensor, label_tensor, raw_text in batch:
+        images.append(img_tensor)
+        labels.append(label_tensor)
+        lengths.append(len(label_tensor))
+        raw_texts.append(raw_text)
 
-    return imgs, targets, target_lengths, raw_texts
+    images = torch.stack(images, dim=0)
+    flat_targets = torch.cat(labels, dim=0) if len(labels) > 0 else torch.empty(0, dtype=torch.long)
+    target_lengths = torch.tensor(lengths, dtype=torch.long)
+    return images, flat_targets, target_lengths, raw_texts
 
 
 # ==============================================================================
-# 2. CÁC HÀM TRAIN VÀ ĐÁNH GIÁ (TRAIN & VALIDATE)
+# 2. HÀM ĐÁNH GIÁ (VALIDATION)
 # ==============================================================================
-def train_one_epoch(model, dataloader, criterion, optimizer, device, clip_grad=5.0):
-    model.train()
-    total_loss = 0.0
-    total_samples = 0
-
-    pbar = tqdm(dataloader, desc="  Train Step", leave=False)
-    for imgs, targets, target_lengths, _ in pbar:
-        batch_size = imgs.size(0)
-        imgs = imgs.to(device)
-        targets = targets.to(device)
-        target_lengths = target_lengths.to(device)
-
-        # Forward
-        logits = model(imgs)  # (B, class_num, time_steps)
-        time_steps = logits.size(2)
-
-        # Chuẩn bị input cho CTCLoss: (Time_Steps, Batch_Size, Class_Num)
-        log_probs = F.log_softmax(logits.permute(2, 0, 1), dim=2)
-        input_lengths = torch.full((batch_size,), time_steps, dtype=torch.long, device=device)
-
-        # Tính CTC Loss
-        loss = criterion(log_probs, targets, input_lengths, target_lengths)
-
-        # Backward & Optimize
-        optimizer.zero_grad()
-        loss.backward()
-
-        if clip_grad > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-
-        optimizer.step()
-
-        loss_val = loss.item()
-        if not np.isnan(loss_val) and not np.isinf(loss_val):
-            total_loss += loss_val * batch_size
-            total_samples += batch_size
-
-        pbar.set_postfix({"loss": f"{loss_val:.4f}"})
-
-    return total_loss / max(1, total_samples)
-
-
-def validate(model, dataloader, criterion, device):
+def validate(model, val_loader, criterion, device):
     model.eval()
     total_loss = 0.0
     total_samples = 0
@@ -155,65 +116,56 @@ def validate(model, dataloader, criterion, device):
     correct_chars = 0
 
     with torch.no_grad():
-        for imgs, targets, target_lengths, raw_texts in tqdm(dataloader, desc="  Val Step  ", leave=False):
-            batch_size = imgs.size(0)
-            imgs = imgs.to(device)
+        for images, targets, target_lengths, raw_texts in val_loader:
+            images = images.to(device)
             targets = targets.to(device)
             target_lengths = target_lengths.to(device)
+            batch_size = images.size(0)
 
-            logits = model(imgs)
-            time_steps = logits.size(2)
-
-            log_probs = F.log_softmax(logits.permute(2, 0, 1), dim=2)
-            input_lengths = torch.full((batch_size,), time_steps, dtype=torch.long, device=device)
+            logits = model(images)
+            T, N, C = logits.size(2), logits.size(0), logits.size(1)
+            log_probs = F.log_softmax(logits, dim=1).permute(2, 0, 1)
+            input_lengths = torch.full((N,), T, dtype=torch.long, device=device)
 
             loss = criterion(log_probs, targets, input_lengths, target_lengths)
-            loss_val = loss.item()
-            if not np.isnan(loss_val) and not np.isinf(loss_val):
-                total_loss += loss_val * batch_size
-                total_samples += batch_size
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                total_loss += loss.item() * batch_size
+            total_samples += batch_size
 
-            # Giải mã CTC Greedy Decoder
             preds = ctc_decode(logits, CHARS, blank_idx=0)
-
-            # Đánh giá độ chính xác (Plate Accuracy & Char Accuracy)
             for pred_str, gt_str in zip(preds, raw_texts):
                 if pred_str == gt_str:
                     correct_plates += 1
 
-                # Đếm ký tự đúng
-                total_chars += len(gt_str)
                 min_len = min(len(pred_str), len(gt_str))
-                for c1, c2 in zip(pred_str[:min_len], gt_str[:min_len]):
-                    if c1 == c2:
+                for c_p, c_g in zip(pred_str[:min_len], gt_str[:min_len]):
+                    if c_p == c_g:
                         correct_chars += 1
+                total_chars += max(len(pred_str), len(gt_str))
 
     avg_loss = total_loss / max(1, total_samples)
-    plate_acc = (correct_plates / max(1, len(dataloader.dataset))) * 100.0
+    plate_acc = (correct_plates / max(1, total_samples)) * 100.0
     char_acc = (correct_chars / max(1, total_chars)) * 100.0
-
     return avg_loss, plate_acc, char_acc
 
 
 # ==============================================================================
-# 3. QUY TRÌNH HUẤN LUYỆN CHÍNH (MAIN PIPELINE)
+# 3. HÀM HUẤN LUYỆN CHÍNH (TRAINING LOOP VỚI HỖ TRỢ FINE-TUNING)
 # ==============================================================================
 def train_lprnet(
     data_dir="data_source/dataset_ocr",
-    save_dir="runs/train/lprnet_stn",
-    epochs=25,
+    real_data_dir=None,
+    real_oversample=5,
+    save_dir="runs/train/lprnet_finetuned",
+    pretrained="runs/train/lprnet_bounded_stn/weights/best.pt",
+    epochs=15,
     batch_size=64,
-    lr=0.001,
+    lr=0.0003,
     use_stn=True,
     two_stage=False,
-    warmup_epochs=10,
+    warmup_epochs=5,
     device=None
 ):
-    """
-    Quy trình huấn luyện hoàn chỉnh mô hình STN + LPRNet:
-    - use_stn=True, two_stage=False: Cách 1 - Bounded STN + LPRNet huấn luyện đồng thời từ đầu.
-    - use_stn=True, two_stage=True:  Cách 2 - Two-Stage Warmup (đóng băng STN pha 1, tinh chỉnh pha 2).
-    """
     data_dir = Path(data_dir)
     save_dir = Path(save_dir)
     weights_dir = save_dir / "weights"
@@ -222,32 +174,49 @@ def train_lprnet(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    mode_name = "Cách 2: Two-Stage Warmup" if (use_stn and two_stage) else ("Cách 1: Bounded STN End-to-End" if use_stn else "LPRNet Thuần (No STN)")
+    is_finetuning = pretrained is not None and Path(pretrained).exists()
+    mode_name = "Giai đoạn 2: Fine-Tuning Trộn Dữ liệu Cũ + Mới" if is_finetuning else ("Two-Stage Warmup" if two_stage else "Bounded STN End-to-End")
 
     print("=" * 65)
     print("🚀 BẮT ĐẦU HUẤN LUYỆN LPRNet + STN (OCR BIỂN SỐ XE)")
-    print(f"🎯 Chiến lược:          {mode_name}")
-    print(f"📂 Dữ liệu nguồn:        {data_dir.resolve()}")
+    print(f"🎯 Chế độ:              {mode_name}")
+    print(f"📂 Dữ liệu gốc (CŨ):    {data_dir.resolve()}")
+    if real_data_dir:
+        print(f"🌟 Dữ liệu thực tế (MỚI): {Path(real_data_dir).resolve()} (Oversample: {real_oversample}x)")
     print(f"📁 Thư mục lưu kết quả: {save_dir.resolve()}")
     print(f"🖥️ Thiết bị tính toán:   {device}")
     print(f"🔄 Module STN nắn thẳng: {'KÍCH HOẠT' if use_stn else 'TẮT'}")
-    if use_stn and two_stage:
-        print(f"⏳ Pha 1 Warmup LPRNet:  Epoch 1 -> {warmup_epochs} (Đóng băng STN)")
-        print(f"🔥 Pha 2 STN Fine-tune:  Epoch {warmup_epochs + 1} -> {epochs} (Mở khóa STN)")
     print(f"⚙️ Epochs: {epochs} | Batch: {batch_size} | Learning Rate: {lr}")
     print("=" * 65)
 
-    # 1. Tạo Dataset & DataLoader
+    # 1. Thu thập dữ liệu thực tế (nếu có)
+    extra_samples = []
+    if real_data_dir:
+        real_p = Path(real_data_dir)
+        real_lbl_file = real_p / "labels.txt"
+        if real_lbl_file.exists():
+            with open(real_lbl_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        img_name, raw_label = parts[0], parts[1].upper()
+                        img_path = real_p / img_name
+                        if img_path.exists() and len(raw_label) >= 2:
+                            for _ in range(real_oversample):
+                                extra_samples.append((img_path, raw_label))
+            print(f"🌟 Đã nạp {len(extra_samples)//real_oversample} biển số thực tế (Nhân bản {real_oversample}x = {len(extra_samples)} mẫu) để trộn vào tập Train!")
+
+    # 2. Tạo Dataset & DataLoader
     train_txt = data_dir / "train.txt"
     val_txt = data_dir / "val.txt"
     train_img_dir = data_dir / "train"
     val_img_dir = data_dir / "val"
 
-    train_dataset = LPRDataset(train_txt, train_img_dir, preload=True)
+    train_dataset = LPRDataset(train_txt, train_img_dir, extra_samples=extra_samples, preload=True)
     val_dataset = LPRDataset(val_txt, val_img_dir, preload=True)
 
-    print(f"✓ Tập Huấn luyện (Train): {len(train_dataset):,} mẫu")
-    print(f"✓ Tập Kiểm thử (Val):     {len(val_dataset):,} mẫu")
+    print(f"✓ Tập Huấn luyện (Train Tổng cộng): {len(train_dataset):,} mẫu (Bảo toàn dữ liệu cũ + Trộn dữ liệu mới)")
+    print(f"✓ Tập Kiểm thử (Val):                {len(val_dataset):,} mẫu")
 
     train_loader = DataLoader(
         train_dataset,
@@ -267,37 +236,23 @@ def train_lprnet(
         pin_memory=torch.cuda.is_available()
     )
 
-    # 2. Khởi tạo mô hình
-    class_num = len(CHARS) + 1  # 30 ký tự + 1 ký tự Blank (index 0)
+    # 3. Khởi tạo mô hình & Nạp Pre-trained
+    class_num = len(CHARS) + 1  # 30 ký tự + 1 Blank (index 0)
     model = STN_LPRNet(class_num=class_num, in_channels=3, use_stn=use_stn)
     model.to(device)
 
-    # 3. Hàm mất mát CTC Loss
+    if is_finetuning:
+        print(f"📥 Đang nạp trọng số pre-trained tốt nhất: {pretrained}")
+        ckpt = torch.load(pretrained, map_location=device)
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+        model.load_state_dict(state_dict)
+        print("✓ Nạp trọng số thành công! Tiếp tục tối ưu hóa chuyên sâu.")
+
+    # 4. Hàm mất mát & Optimizer
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.05)
 
-    def build_optimizer(cur_epoch):
-        """Khởi tạo optimizer phù hợp với từng giai đoạn nếu chạy Two-Stage."""
-        if use_stn and two_stage and cur_epoch <= warmup_epochs:
-            # Pha 1: Đóng băng STN, chỉ tối ưu LPRNet
-            for p in model.stn.parameters():
-                p.requires_grad = False
-            return torch.optim.AdamW(model.lprnet.parameters(), lr=lr, weight_decay=1e-4)
-        elif use_stn and two_stage and cur_epoch > warmup_epochs:
-            # Pha 2: Mở khóa STN, STN dùng lr nhỏ hơn (0.1x) để tinh chỉnh êm ái
-            for p in model.stn.parameters():
-                p.requires_grad = True
-            param_groups = [
-                {"params": model.lprnet.parameters(), "lr": lr * 0.5},
-                {"params": model.stn.parameters(), "lr": lr * 0.1}
-            ]
-            return torch.optim.AdamW(param_groups, weight_decay=1e-4)
-        else:
-            return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-
-    optimizer = build_optimizer(1)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
-
-    # File log lịch sử
     history_file = save_dir / "history.csv"
     with open(history_file, "w", encoding="utf-8") as f:
         f.write("epoch,train_loss,val_loss,val_char_acc,val_plate_acc,lr\n")
@@ -305,21 +260,41 @@ def train_lprnet(
     best_plate_acc = 0.0
     start_time = time.time()
 
-    # 4. Vòng lặp huấn luyện từng Epoch
+    # 5. Vòng lặp huấn luyện từng Epoch
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
+        model.train()
+        total_train_loss = 0.0
+        train_batches = 0
 
-        # Kiểm tra chuyển pha nếu chạy Two-Stage
-        if use_stn and two_stage and epoch == warmup_epochs + 1:
-            print(f"\n🔄 [CHUYỂN PHA HUẤN LUYỆN] Mở khóa Module STN để tinh chỉnh nắn thẳng...")
-            optimizer = build_optimizer(epoch)
-            remaining_epochs = epochs - warmup_epochs
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=lr * 0.005)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{epochs:02d} [Train]")
+        for images, targets, target_lengths, _ in pbar:
+            images = images.to(device)
+            targets = targets.to(device)
+            target_lengths = target_lengths.to(device)
+            batch_size_cur = images.size(0)
 
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            optimizer.zero_grad()
+            logits = model(images)
+            T, N, C = logits.size(2), logits.size(0), logits.size(1)
+            log_probs = F.log_softmax(logits, dim=1).permute(2, 0, 1)
+            input_lengths = torch.full((N,), T, dtype=torch.long, device=device)
+
+            loss = criterion(log_probs, targets, input_lengths, target_lengths)
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+
+            total_train_loss += loss.item() * batch_size_cur
+            train_batches += batch_size_cur
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        train_loss = total_train_loss / max(1, train_batches)
         val_loss, val_plate_acc, val_char_acc = validate(model, val_loader, criterion, device)
         current_lr = optimizer.param_groups[0]["lr"]
-
         scheduler.step()
         epoch_time = time.time() - epoch_start
 
@@ -327,7 +302,6 @@ def train_lprnet(
         with open(history_file, "a", encoding="utf-8") as f:
             f.write(f"{epoch},{train_loss:.4f},{val_loss:.4f},{val_char_acc:.2f},{val_plate_acc:.2f},{current_lr:.6f}\n")
 
-        # In tiến trình
         print(
             f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_time:.1f}s) | "
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
@@ -335,7 +309,7 @@ def train_lprnet(
             f"LR: {current_lr:.6f}"
         )
 
-        # Lưu checkpoint trọng số tốt nhất (best.pt)
+        # Lưu checkpoint tốt nhất
         if val_plate_acc >= best_plate_acc:
             best_plate_acc = val_plate_acc
             best_model_path = weights_dir / "best.pt"
@@ -352,19 +326,18 @@ def train_lprnet(
             }, best_model_path)
             print(f"  🏆 Đạt kỷ lục mới! Đã lưu trọng số tốt nhất tại: {best_model_path}")
 
-        # Luôn lưu checkpoint cuối cùng (last.pt)
-        last_model_path = weights_dir / "last.pt"
+        # Lưu last.pt
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "plate_acc": val_plate_acc,
             "char_acc": val_char_acc
-        }, last_model_path)
+        }, weights_dir / "last.pt")
 
     total_training_time = time.time() - start_time
     print("\n" + "=" * 65)
-    print("🎉 HUẤN LUYỆN LPRNet + STN HOÀN TẤT THÀNH CÔNG!")
-    print(f"🎯 Chiến lược:                {mode_name}")
+    print("🎉 HOÀN THÀNH GIAI ĐOẠN 2: HUẤN LUYỆN TINH CHỈNH THÀNH CÔNG!")
+    print(f"🎯 Chế độ:                    {mode_name}")
     print(f"⏱️ Tổng thời gian huấn luyện: {total_training_time / 60:.2f} phút")
     print(f"🏆 Độ chính xác biển số cao nhất (Best Plate Acc): {best_plate_acc:.2f}%")
     print(f"🥇 Trọng số tối ưu đã lưu:   {weights_dir / 'best.pt'}")
@@ -374,23 +347,27 @@ def train_lprnet(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Huấn luyện mô hình LPRNet + STN nhận diện biển số xe")
-    parser.add_argument("--data_dir", type=str, default="data_source/dataset_ocr", help="Thư mục dataset OCR")
-    parser.add_argument("--save_dir", type=str, default="runs/train/lprnet_stn", help="Thư mục lưu kết quả huấn luyện")
-    parser.add_argument("--epochs", type=int, default=25, help="Số lượng epoch huấn luyện")
+    parser.add_argument("--data_dir", type=str, default="data_source/dataset_ocr", help="Thư mục dataset OCR gốc")
+    parser.add_argument("--real_data_dir", type=str, default="data_source/real_cropped_plates", help="Thư mục chứa ảnh biển số thực tế vừa cắt")
+    parser.add_argument("--real_oversample", type=int, default=5, help="Tỷ lệ nhân bản dữ liệu thực tế để tăng trọng số học")
+    parser.add_argument("--pretrained", type=str, default="runs/train/lprnet_bounded_stn/weights/best.pt", help="Trọng số tốt nhất trước đó")
+    parser.add_argument("--save_dir", type=str, default="runs/train/lprnet_finetuned", help="Thư mục lưu kết quả huấn luyện")
+    parser.add_argument("--epochs", type=int, default=15, help="Số lượng epoch huấn luyện")
     parser.add_argument("--batch_size", type=int, default=64, help="Kích thước batch")
-    parser.add_argument("--lr", type=float, default=0.001, help="Tốc độ học khởi tạo (Learning Rate)")
-    parser.add_argument("--no_stn", action="store_true", help="Tắt module STN (huấn luyện LPRNet thuần)")
-    parser.add_argument("--two_stage", action="store_true", help="Kích hoạt chiến lược huấn luyện 2 pha (Warmup LPRNet trước)")
-    parser.add_argument("--warmup_epochs", type=int, default=10, help="Số epoch cho pha 1 nếu dùng two_stage")
+    parser.add_argument("--lr", type=float, default=0.0003, help="Tốc độ học tinh chỉnh (Learning Rate)")
+    parser.add_argument("--no_stn", action="store_true", help="Tắt module STN")
+    parser.add_argument("--two_stage", action="store_true", help="Kích hoạt chiến lược 2 pha")
     args = parser.parse_args()
 
     train_lprnet(
         data_dir=args.data_dir,
+        real_data_dir=args.real_data_dir,
+        real_oversample=args.real_oversample,
         save_dir=args.save_dir,
+        pretrained=args.pretrained,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         use_stn=not args.no_stn,
-        two_stage=args.two_stage,
-        warmup_epochs=args.warmup_epochs
+        two_stage=args.two_stage
     )

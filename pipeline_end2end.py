@@ -4,7 +4,7 @@ Bước 4: Pipeline End-to-End ALPR Hoàn Chỉnh (Edge ALPR System)
 Kết nối đồng bộ 3 Module lõi theo kiến trúc 2 giai đoạn (Cascaded ALPR):
 1. Module Track xe:   YOLO11n + ByteTrack (Nhận diện xe & gán Track ID)
 2. Module Dò biển:    YOLO11n Plate Detector (Tìm biển số TRONG THÂN XE)
-3. Module Đọc biển:   STN + LPRNet (Tự nắn thẳng chống rung & đọc chuỗi ký tự)
+3. Module Đọc biển:   STN + LPRNet Fine-tuned (Tự nắn thẳng chống rung & đọc chuỗi ký tự)
 + Cơ chế Majority Voting qua Track ID loại bỏ hoàn toàn nhiễu mờ do camera rung!
 ==============================================================================
 """
@@ -34,16 +34,12 @@ def format_vietnamese_plate(raw_text):
     """
     s = raw_text.strip().upper()
     if len(s) == 8:
-        # Ví dụ: 30A12345 -> 30A - 123.45
         return f"{s[:3]}-{s[3:6]}.{s[6:]}"
     elif len(s) == 9:
-        # Ví dụ: 29G112345 -> 29G1 - 123.45
         return f"{s[:4]}-{s[4:7]}.{s[7:]}"
     elif len(s) == 6:
-        # Ví dụ xe quân đội 4 số: TM1234 -> TM - 12.34
         return f"{s[:2]}-{s[2:4]}.{s[4:]}"
     elif len(s) == 7:
-        # Xe biển 4 số cũ hoặc quân đội 5 số: QK12345 -> QK - 123.45
         return f"{s[:2]}-{s[2:5]}.{s[5:]}"
     return s
 
@@ -56,22 +52,22 @@ class EdgeALPRPipeline:
         self,
         vehicle_weights="yolo11n.pt",
         plate_weights="runs/train/yolo11n_license_plate/weights/best.pt",
-        lpr_weights="runs/train/lprnet_bounded_stn/weights/best.pt",
+        lpr_weights="runs/train/lprnet_finetuned/weights/best.pt",
         tracker_cfg="bytetrack.yaml",
-        conf_vehicle=0.35,
-        conf_plate=0.25,
+        conf_vehicle=0.30,
+        conf_plate=0.18,
         padding_plate=0.08,
         device=None
     ):
-        self.conf_vehicle = conf_vehicle
-        self.conf_plate = conf_plate
-        self.padding_plate = padding_plate
-        self.tracker_cfg = tracker_cfg
-
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
+
+        self.conf_vehicle = conf_vehicle
+        self.conf_plate = conf_plate
+        self.padding_plate = padding_plate
+        self.tracker_cfg = tracker_cfg
 
         print("=" * 65)
         print("🚀 ĐANG KHỞI TẠO PIPELINE END-TO-END ALPR (HỆ THỐNG BIÊN)")
@@ -96,48 +92,35 @@ class EdgeALPRPipeline:
             self.lpr_model.load_state_dict(state_dict)
             print("   ✓ Đã nạp thành công trọng số LPRNet + STN!")
         else:
-            print(f"   ⚠️ CẢNH BÁO: Không tìm thấy {lpr_weights}, dùng trọng số ngẫu nhiên.")
-
+            print(f"   ⚠️ Không tìm thấy trọng số OCR: {lpr_weights}, dùng trọng số khởi tạo ngẫu nhiên.")
+        
         self.lpr_model.to(self.device)
         self.lpr_model.eval()
 
-        # Bộ nhớ theo dõi đa frame để bầu chọn (Majority Voting Buffer)
-        # track_history[track_id] = list các kết quả đọc qua từng frame
+        # Bộ nhớ theo dõi đa khung hình (Temporal Voting Memory)
         self.track_history = defaultdict(list)
         self.final_plate_decision = {}
 
-        # Danh sách tên class xe COCO
+        # Class xe cần theo dõi từ COCO:
+        # 2: car, 3: motorcycle, 5: bus, 7: truck
         self.vehicle_classes = {2: "Car", 3: "Motorcycle", 5: "Bus", 7: "Truck"}
         print("=" * 65)
 
     def read_plate_ocr(self, plate_crop_bgr):
-        """
-        Nắn thẳng bằng STN và giải mã chuỗi ký tự bằng LPRNet:
-        - Input:  Ảnh cắt ô biển số (BGR)
-        - Output: Chuỗi text biển số đọc được
-        """
         if plate_crop_bgr is None or plate_crop_bgr.size == 0:
             return ""
 
-        # Resize chuẩn kích thước (94, 24) và chuẩn hóa [-1, 1]
         img_resized = cv2.resize(plate_crop_bgr, (94, 24), interpolation=cv2.INTER_AREA)
         img_norm = (img_resized.astype(np.float32) - 127.5) * 0.0078125
         img_tensor = torch.from_numpy(img_norm.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            logits, rectified_img, theta = self.lpr_model(img_tensor, return_rectified=True)
+            logits = self.lpr_model(img_tensor)
             pred_text = ctc_decode(logits, CHARS, blank_idx=0)[0]
 
         return pred_text
 
     def process_frame(self, frame_bgr):
-        """
-        Xử lý 1 khung hình qua trọn vẹn 3 Module:
-        1. Track xe -> Bounding box xe + Track ID
-        2. Dò biển số BÊN TRONG THÂN XE -> Bounding box biển
-        3. Đọc biển số -> Nắn thẳng STN + OCR LPRNet + Majority Vote
-        4. Vẽ kết quả trực quan
-        """
         h_frame, w_frame = frame_bgr.shape[:2]
         annotated_frame = frame_bgr.copy()
 
@@ -165,8 +148,7 @@ class EdgeALPRPipeline:
             )
 
             for (vx1, vy1, vx2, vy2), cls_id, track_id in zip(xyxy_arr, cls_arr, track_ids):
-                # Bỏ qua xe quá nhỏ ở đường chân trời xa
-                if (vx2 - vx1) < 60 or (vy2 - vy1) < 50:
+                if (vx2 - vx1) < 50 or (vy2 - vy1) < 40:
                     continue
 
                 vx1_c = max(0, vx1)
@@ -188,12 +170,10 @@ class EdgeALPRPipeline:
             track_id = veh["track_id"]
             cls_name = veh["cls_name"]
 
-            # Cắt ảnh thân xe (Loại bỏ hoàn toàn góc ngày giờ ở đáy video!)
             car_crop = frame_bgr[vy1:vy2, vx1:vx2]
             if car_crop.size == 0:
                 continue
 
-            # Chạy dò biển số bên trong ô thân xe
             plate_results = self.plate_model(car_crop, conf=self.conf_plate, verbose=False)
 
             detected_plate_str = ""
@@ -202,7 +182,6 @@ class EdgeALPRPipeline:
             if plate_results and len(plate_results) > 0 and plate_results[0].boxes is not None:
                 p_boxes = plate_results[0].boxes
                 if len(p_boxes) > 0:
-                    # Lấy biển số có độ tin cậy cao nhất trong xe
                     best_idx = torch.argmax(p_boxes.conf).item()
                     p_xyxy = p_boxes.xyxy[best_idx].cpu().numpy().astype(int)
                     px1_car, py1_car, px2_car, py2_car = p_xyxy
@@ -210,7 +189,6 @@ class EdgeALPRPipeline:
                     pw = px2_car - px1_car
                     ph = py2_car - py1_car
 
-                    # Nới rộng viền thông minh (Smart Padding 8%)
                     pad_w = int(pw * self.padding_plate)
                     pad_h = int(ph * self.padding_plate)
 
@@ -221,7 +199,6 @@ class EdgeALPRPipeline:
 
                     plate_crop = car_crop[py1_pad:py2_pad, px1_pad:px2_pad]
 
-                    # Chuyển đổi tọa độ biển số sang hệ tọa độ toàn khung hình
                     best_plate_box_frame = (
                         vx1 + px1_car,
                         vy1 + py1_car,
@@ -229,9 +206,8 @@ class EdgeALPRPipeline:
                         vy1 + py2_car
                     )
 
-                    # ĐỌC CHỮ BẰNG STN + LPRNET
                     raw_text = self.read_plate_ocr(plate_crop)
-                    if len(raw_text) >= 4:
+                    if len(raw_text) >= 2:
                         detected_plate_str = raw_text
 
             # -------------------------------------------------------------
@@ -239,191 +215,197 @@ class EdgeALPRPipeline:
             # -------------------------------------------------------------
             if detected_plate_str:
                 self.track_history[track_id].append(detected_plate_str)
-                # Giữ tối đa 20 frame gần nhất
                 if len(self.track_history[track_id]) > 20:
                     self.track_history[track_id].pop(0)
 
-                # Chọn kết quả xuất hiện nhiều nhất (Majority Vote)
                 most_common_plate, count = Counter(self.track_history[track_id]).most_common(1)[0]
                 self.final_plate_decision[track_id] = most_common_plate
 
             display_plate = self.final_plate_decision.get(track_id, "")
-            display_plate_formatted = format_vietnamese_plate(display_plate) if display_plate else ""
+            formatted_plate = format_vietnamese_plate(display_plate) if display_plate else ""
 
             # -------------------------------------------------------------
-            # VẼ KẾT QUẢ TRỰC QUAN LÊN KHUNG HÌNH (VISUALIZATION)
+            # VẼ TRỰC QUAN HÓA (VISUALIZATION)
             # -------------------------------------------------------------
-            # 1. Vẽ Box xe (Màu xanh dương/ngọc)
-            cv2.rectangle(annotated_frame, (vx1, vy1), (vx2, vy2), (0, 220, 255), 2)
+            # 1. Vẽ Box xe
+            veh_color = (0, 230, 115)  # Xanh ngọc
+            cv2.rectangle(annotated_frame, (vx1, vy1), (vx2, vy2), veh_color, 2)
 
-            # 2. Vẽ Box biển số nếu phát hiện được (Màu cam/đỏ)
+            veh_label = f"ID:{track_id} {cls_name}"
+            (tw, th), _ = cv2.getTextSize(veh_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(annotated_frame, (vx1, vy1 - th - 8), (vx1 + tw + 6, vy1), veh_color, -1)
+            cv2.putText(annotated_frame, veh_label, (vx1 + 3, vy1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+            # 2. Vẽ Box biển số
             if best_plate_box_frame is not None:
-                bx1, by1, bx2, by2 = best_plate_box_frame
-                cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0, 69, 255), 2)
+                px1, py1, px2, py2 = best_plate_box_frame
+                cv2.rectangle(annotated_frame, (px1, py1), (px2, py2), (0, 100, 255), 2)
 
-            # 3. Banner thông tin xe + Biển số phía trên nóc xe
-            track_label = f"#{track_id} {cls_name}"
-            if display_plate_formatted:
-                full_banner = f"{track_label} | {display_plate_formatted}"
-                banner_color = (0, 200, 0) # Xanh lá đậm khi đã đọc được biển
-            else:
-                full_banner = track_label
-                banner_color = (0, 160, 220)
+            # 3. Vẽ Banner hiển thị Biển số xe
+            if formatted_plate:
+                plate_text = f"[{formatted_plate}]"
+                font_scale = 0.75
+                thickness = 2
+                (ptw, pth), _ = cv2.getTextSize(plate_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
 
-            # Tạo nền đen mờ sau chữ để chữ luôn nổi bật
-            (tw, th), baseline = cv2.getTextSize(full_banner, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-            banner_y1 = max(0, vy1 - th - 12)
-            banner_y2 = vy1
-            cv2.rectangle(annotated_frame, (vx1, banner_y1), (vx1 + tw + 10, banner_y2), (20, 20, 20), -1)
-            cv2.putText(
-                annotated_frame,
-                full_banner,
-                (vx1 + 5, banner_y2 - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                banner_color,
-                2,
-                cv2.LINE_AA
-            )
+                banner_x = vx1 + 5
+                banner_y = max(pth + 10, vy1 - th - 12)
+
+                cv2.rectangle(annotated_frame, (banner_x - 4, banner_y - pth - 6), (banner_x + ptw + 6, banner_y + 4), (20, 20, 20), -1)
+                cv2.rectangle(annotated_frame, (banner_x - 4, banner_y - pth - 6), (banner_x + ptw + 6, banner_y + 4), (0, 220, 255), 2)
+                cv2.putText(annotated_frame, plate_text, (banner_x, banner_y - 2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), thickness)
 
         return annotated_frame
 
 
-# ==============================================================================
-# HÀM THỰC THI CHÍNH TRÊN FILE VIDEO HOẶC THƯ MỤC FRAME
-# ==============================================================================
+def process_single_video_pipeline(video_path, out_video_path, snap_dir, pipeline):
+    video_p = Path(video_path)
+    cap = cv2.VideoCapture(str(video_p))
+    if not cap.isOpened():
+        print(f"❌ Không mở được video: {video_p}")
+        return
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    input_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    out_p = Path(out_video_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    snap_p = Path(snap_dir) if snap_dir else None
+    if snap_p:
+        snap_p.mkdir(parents=True, exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_p), fourcc, input_fps, (w, h))
+
+    print(f"\n🎬 Đang xử lý Video: {video_p.name} ({total_frames} frames, {w}x{h} px, {input_fps:.1f} FPS)")
+    frame_idx = 0
+    t_start = time.time()
+    saved_snaps = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        t0 = time.time()
+        annotated = pipeline.process_frame(frame)
+        proc_fps = 1.0 / max(1e-5, (time.time() - t0))
+
+        # Lưu ảnh chụp nhanh (snapshot) nếu có biển số phát hiện
+        active_plates = [p for p in pipeline.final_plate_decision.values() if p]
+        if snap_p and active_plates and frame_idx % 15 == 0 and saved_snaps < 8:
+            snap_file = snap_p / f"{video_p.stem}_f{frame_idx:04d}_{'_'.join(active_plates[:2])}.jpg"
+            cv2.imwrite(str(snap_file), annotated)
+            saved_snaps += 1
+
+        cv2.putText(annotated, f"Edge ALPR | FPS: {proc_fps:.1f} | Frame: {frame_idx}/{total_frames}", (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        writer.write(annotated)
+        frame_idx += 1
+
+        if frame_idx % 60 == 0 or frame_idx == total_frames:
+            elapsed = time.time() - t_start
+            print(f"   -> Frame {frame_idx:04d}/{total_frames} | Tốc độ: {frame_idx/elapsed:.1f} FPS | Đang nhận diện {len(pipeline.final_plate_decision)} xe")
+
+    cap.release()
+    writer.release()
+    total_time = time.time() - t_start
+
+    print(f"\n--- KẾT QUẢ CHO {video_p.name} ---")
+    print(f"⏱️ Tổng thời gian:     {total_time:.2f}s ({total_frames/total_time:.1f} FPS)")
+    print(f"🚗 Tổng số xe theo dõi: {len(pipeline.track_history)} xe")
+    print(f"🏷️ Danh sách biển số nhận diện theo Track ID:")
+    for track_id, plate in pipeline.final_plate_decision.items():
+        history = pipeline.track_history.get(track_id, [])
+        counts = Counter(history)
+        print(f"   - [Track ID #{track_id}] Biển số: {format_vietnamese_plate(plate)} (Tần suất: {counts.get(plate, 0)}/{len(history)} frames)")
+    print(f"📁 Video xuất: {out_p.resolve()}")
+
+
 def run_pipeline(
-    source,
-    output_path="output/pipeline_result.mp4",
+    source="data_source/videos",
+    output_path="output/final_end2end",
     vehicle_model="yolo11n.pt",
     plate_model="runs/train/yolo11n_license_plate/weights/best.pt",
-    lpr_model="runs/train/lprnet_bounded_stn/weights/best.pt",
-    conf_vehicle=0.35,
-    conf_plate=0.25,
-    show=False
+    lpr_model="runs/train/lprnet_finetuned/weights/best.pt",
+    conf_vehicle=0.30,
+    conf_plate=0.18
 ):
     source_p = Path(source)
-    pipeline = EdgeALPRPipeline(
-        vehicle_weights=vehicle_model,
-        plate_weights=plate_model,
-        lpr_weights=lpr_model,
-        conf_vehicle=conf_vehicle,
-        conf_plate=conf_plate
-    )
+    out_p = Path(output_path)
+    out_p.mkdir(parents=True, exist_ok=True)
+    snap_dir = out_p / "snapshots"
 
-    # 1. Trường hợp Source là một thư mục chứa chuỗi ảnh frame (Clip camera hành trình)
-    if source_p.is_dir():
-        image_exts = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG")
-        image_files = []
-        for ext in image_exts:
-            image_files.extend(source_p.glob(ext))
-        image_files = sorted(image_files)
+    # 1. Nếu nguồn là 1 video đơn
+    if source_p.is_file() and source_p.suffix.lower() in [".mp4", ".avi", ".mov", ".mkv"]:
+        pipeline = EdgeALPRPipeline(
+            vehicle_weights=vehicle_model,
+            plate_weights=plate_model,
+            lpr_weights=lpr_model,
+            conf_vehicle=conf_vehicle,
+            conf_plate=conf_plate
+        )
+        out_vid = out_p / f"{source_p.stem}_annotated.mp4" if out_p.is_dir() else out_p
+        process_single_video_pipeline(source_p, out_vid, snap_dir, pipeline)
 
-        if not image_files:
-            print(f"❌ Không tìm thấy ảnh nào trong thư mục: {source_p}")
-            return
+    # 2. Nếu nguồn là thư mục chứa nhiều video
+    elif source_p.is_dir():
+        video_files = sorted([p for p in source_p.iterdir() if p.suffix.lower() in [".mp4", ".avi", ".mov", ".mkv"]])
+        if not video_files and (source_p / "videos").exists():
+            video_files = sorted([p for p in (source_p / "videos").iterdir() if p.suffix.lower() in [".mp4", ".avi", ".mov", ".mkv"]])
 
-        print(f"\n🎬 Bắt đầu xử lý chuỗi {len(image_files)} khung hình từ clip: {source_p.name}")
-        out_dir = Path("output") / f"pipeline_{source_p.name}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        if video_files:
+            print(f"🎬 Tìm thấy {len(video_files)} video. Bắt đầu xử lý từng video...")
+            for vf in video_files:
+                pipeline = EdgeALPRPipeline(
+                    vehicle_weights=vehicle_model,
+                    plate_weights=plate_model,
+                    lpr_weights=lpr_model,
+                    conf_vehicle=conf_vehicle,
+                    conf_plate=conf_plate
+                )
+                out_vid = out_p / f"{vf.stem}_annotated.mp4"
+                process_single_video_pipeline(vf, out_vid, snap_dir, pipeline)
+        else:
+            # Xử lý chuỗi frame ảnh nếu không có video
+            image_files = sorted(list(source_p.glob("*.jpg")) + list(source_p.glob("*.png")))
+            if image_files:
+                pipeline = EdgeALPRPipeline(
+                    vehicle_weights=vehicle_model,
+                    plate_weights=plate_model,
+                    lpr_weights=lpr_model,
+                    conf_vehicle=conf_vehicle,
+                    conf_plate=conf_plate
+                )
+                out_dir = out_p / f"pipeline_{source_p.name}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                sample_img = cv2.imread(str(image_files[0]))
+                h, w = sample_img.shape[:2]
+                video_out_path = out_p / f"{source_p.name}_annotated.mp4"
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(video_out_path), fourcc, 10.0, (w, h))
 
-        # Khởi tạo VideoWriter để ghép chuỗi frame thành video MP4
-        sample_img = cv2.imread(str(image_files[0]))
-        h, w = sample_img.shape[:2]
-        video_out_path = Path("output") / f"{source_p.name}_annotated.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(video_out_path), fourcc, 10.0, (w, h))
-
-        t_start = time.time()
-        for idx, img_file in enumerate(image_files):
-            frame = cv2.imread(str(img_file))
-            if frame is None:
-                continue
-
-            t0 = time.time()
-            annotated = pipeline.process_frame(frame)
-            fps = 1.0 / max(1e-5, (time.time() - t0))
-
-            # Vẽ chỉ số FPS góc trái trên
-            cv2.putText(annotated, f"Edge ALPR Pipeline | FPS: {fps:.1f}", (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-
-            # Lưu ảnh kết quả và ghi vào video
-            cv2.imwrite(str(out_dir / img_file.name), annotated)
-            writer.write(annotated)
-
-            if (idx + 1) % 5 == 0 or idx + 1 == len(image_files):
-                print(f"   -> Đã xử lý {idx + 1}/{len(image_files)} frames ({fps:.1f} FPS)")
-
-        writer.release()
-        total_time = time.time() - t_start
-        print("\n" + "=" * 65)
-        print("🎉 HOÀN TẤT XỬ LÝ TOÀN BỘ CHUỖI KHUNG HÌNH!")
-        print(f"⏱️ Tổng thời gian:     {total_time:.2f}s (Tốc độ TB: {len(image_files)/total_time:.1f} FPS)")
-        print(f"📁 Thư mục ảnh xuất:   {out_dir.resolve()}")
-        print(f"🎬 Video xuất:         {video_out_path.resolve()}")
-        print("=" * 65)
-
-    # 2. Trường hợp Source là một Video đơn (.mp4, .avi)
-    elif source_p.is_file() and source_p.suffix.lower() in [".mp4", ".avi", ".mov", ".mkv"]:
-        cap = cv2.VideoCapture(str(source_p))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        input_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-
-        out_path = Path(output_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, input_fps, (w, h))
-
-        print(f"\n🎬 Bắt đầu xử lý Video: {source_p.name} ({total_frames} frames, {w}x{h} px)")
-        frame_idx = 0
-        t_start = time.time()
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            t0 = time.time()
-            annotated = pipeline.process_frame(frame)
-            fps = 1.0 / max(1e-5, (time.time() - t0))
-
-            cv2.putText(annotated, f"FPS: {fps:.1f}", (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-            writer.write(annotated)
-            frame_idx += 1
-
-            if frame_idx % 25 == 0 or frame_idx == total_frames:
-                print(f"   -> Đang xử lý: {frame_idx}/{total_frames} frames ({fps:.1f} FPS)")
-
-        cap.release()
-        writer.release()
-        print("\n" + "=" * 65)
-        print(f"🎉 HOÀN TẤT XỬ LÝ VIDEO! Đã lưu tại: {out_path.resolve()}")
-        print("=" * 65)
-
-    # 3. Trường hợp Source là một file ảnh đơn (.jpg, .png)
-    elif source_p.is_file():
-        frame = cv2.imread(str(source_p))
-        if frame is None:
-            print(f"❌ Không đọc được ảnh: {source_p}")
-            return
-        annotated = pipeline.process_frame(frame)
-        out_path = Path("output") / f"annotated_{source_p.name}"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_path), annotated)
-        print(f"✓ Đã xử lý ảnh thành công: {out_path.resolve()}")
+                for idx, img_file in enumerate(image_files):
+                    frame = cv2.imread(str(img_file))
+                    if frame is None:
+                        continue
+                    annotated = pipeline.process_frame(frame)
+                    cv2.imwrite(str(out_dir / img_file.name), annotated)
+                    writer.write(annotated)
+                writer.release()
+                print(f"✓ Hoàn tất chuỗi frame: {video_out_path.resolve()}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Chạy Pipeline End-to-End ALPR nhận diện xe và biển số")
-    parser.add_argument("--source", type=str, default="data_source/organized_frames_dataset/test/1f652a87_447_clip_005_0027_0034_N", help="Đường dẫn video / thư mục clip / ảnh")
-    parser.add_argument("--output", type=str, default="output/pipeline_output.mp4", help="Đường dẫn lưu video kết quả")
+    parser.add_argument("--source", type=str, default="data_source/videos", help="Đường dẫn video / thư mục video")
+    parser.add_argument("--output", type=str, default="output/final_end2end", help="Thư mục lưu video và snapshot kết quả")
     parser.add_argument("--vehicle_model", type=str, default="yolo11n.pt", help="Mô hình phát hiện xe")
     parser.add_argument("--plate_model", type=str, default="runs/train/yolo11n_license_plate/weights/best.pt", help="Mô hình dò biển số")
-    parser.add_argument("--lpr_model", type=str, default="runs/train/lprnet_bounded_stn/weights/best.pt", help="Mô hình STN + LPRNet đọc chữ")
-    parser.add_argument("--conf_vehicle", type=float, default=0.35, help="Ngưỡng tự tin phát hiện xe")
-    parser.add_argument("--conf_plate", type=float, default=0.25, help="Ngưỡng tự tin phát hiện biển số")
+    parser.add_argument("--lpr_model", type=str, default="runs/train/lprnet_finetuned/weights/best.pt", help="Mô hình STN + LPRNet fine-tuned")
+    parser.add_argument("--conf_vehicle", type=float, default=0.30, help="Ngưỡng tự tin phát hiện xe")
+    parser.add_argument("--conf_plate", type=float, default=0.18, help="Ngưỡng tự tin phát hiện biển số")
     args = parser.parse_args()
 
     run_pipeline(
