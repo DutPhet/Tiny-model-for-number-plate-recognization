@@ -1,0 +1,12 @@
+# Đường dẫn thư mục gốc của dataset (sử dụng đường dẫn tuyệt đối hoặc tương đối tính từ file yaml)
+path: data_source/Vietnam license-plate.v1i.yolov8
+train: train/images
+val: valid/images
+test: test/images
+
+# Số lượng class và tên class
+nc: 1
+names: ['license_plate']
+
+# Cấu hình dự phòng nếu muốn đổi sang dataset License Plate Detection:
+# path: data_source/License Plate Detection.v1i.yolov8

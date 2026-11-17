@@ -158,6 +158,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+myenv/
 
 # Spyder project settings
 .spyderproject
@@ -197,11 +198,7 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore that
-#   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, you
-#   could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
@@ -218,3 +215,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==============================================================================
+# Edge ALPR Project - Heavy Folders, Datasets & Outputs
+# ==============================================================================
+# Heavy datasets & labels
+data/
+data_source/
+dataset/
+datasets/
+*.cache
+
+# Heavy predictions, exported frames, videos & training runs
+output/
+runs/
+notebook/*.pt
+*.mp4
+*.avi
+*.mkv
+*.mov
+
