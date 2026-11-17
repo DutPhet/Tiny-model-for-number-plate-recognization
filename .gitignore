@@ -226,8 +226,12 @@ dataset/
 datasets/
 *.cache
 
-# Heavy predictions, exported frames & training runs
+# Heavy predictions, exported frames, videos & training runs
 output/
 runs/
 notebook/*.pt
+*.mp4
+*.avi
+*.mkv
+*.mov
 
