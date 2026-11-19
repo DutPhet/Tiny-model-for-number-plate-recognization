@@ -202,7 +202,9 @@ class BoTSORTKalmanFilter:
 
         y = z - (self.H @ self.x)
         S = self.H @ self.P @ self.H.T + R_meas
-        K = self.P @ self.H.T @ np.linalg.inv(S)
+        # Dùng np.linalg.solve thay vì inv() để tăng ổn định số học
+        PHt = self.P @ self.H.T
+        K = np.linalg.solve(S.T, PHt.T).T
         self.x = self.x + (K @ y)
         self.x[2] = max(float(self.x[2]), 4.0)
         self.x[3] = max(float(self.x[3]), 4.0)
@@ -286,7 +288,7 @@ class DashcamHybridTracker:
     Bộ bám vết phương tiện lai BoT-SORT + OC-SORT + ByteTrack + CMC:
     - Tối ưu 1 lớp `vehicle`: dùng ràng buộc diện tích & tỷ lệ khung hình (w/h)
       thay cho khóa cứng `cls_id` để ngăn xe máy chạy cắt ngang cướp ID của ô tô.
-    - Lọc bỏ xe quá nhỏ ở xa (`min_det_area_ratio`) ngay đầu vào để tiết kiệm CPU ở biên.
+    - Lọc bỏ xe quá nhỏ ở xa (`min_det_area_ratio`) ngay đầu vào để tiết kiệm CPU/GPU.
     """
     def __init__(
         self,
@@ -400,6 +402,29 @@ class DashcamHybridTracker:
                 cos_sim = (vecs[valid] @ t_dir) / norms[valid]
                 bonus[r, valid] = self.ocm_weight * np.clip(cos_sim, -1.0, 1.0)
         return bonus
+
+    def update_dets(
+        self,
+        dets: np.ndarray,
+        now_ts: float = 0.0,
+        frame_bgr: np.ndarray | None = None,
+        frame_wh: tuple[int, int] | None = None,
+    ):
+        """Giao diện nhận mảng gộp dets shape (N, 5) hoặc (N, 6): [x1, y1, x2, y2, score, (cls)]."""
+        if dets is None or len(dets) == 0:
+            return self.update(
+                np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.int64),
+                np.zeros((0,), dtype=np.float32),
+                now_ts=now_ts,
+                frame_bgr=frame_bgr,
+                frame_wh=frame_wh,
+            )
+        dets = np.asarray(dets, dtype=np.float32)
+        boxes = dets[:, :4]
+        scores = dets[:, 4] if dets.shape[1] >= 5 else np.full((len(dets),), 0.90, dtype=np.float32)
+        labels = dets[:, 5].astype(np.int64) if dets.shape[1] >= 6 else np.zeros((len(dets),), dtype=np.int64)
+        return self.update(boxes, labels, scores, now_ts=now_ts, frame_bgr=frame_bgr, frame_wh=frame_wh)
 
     def update(
         self,
