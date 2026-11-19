@@ -2,12 +2,11 @@
 Module 1 & Module 2: D-FINE (Fine-grained Distribution Refinement DETR - ICLR 2025)
 Paper: Peng et al., "D-FINE: Redefine Regression Task in DETRs as Fine-grained Distribution Refinement", ICLR 2025.
 
-Nâng cấp chuyên biệt cho tập dữ liệu vừa và nhỏ (< 2,000 ảnh):
-1. Tích hợp Contrastive Denoising Training (CDN): Bơm thêm các truy vấn nhiễu quanh nhãn thật
-   vào Decoder trong lúc train (kèm Attention Mask cách ly) giúp hội tụ nhanh gấp 4-5 lần.
+Đã tối ưu:
+1. Contrastive Denoising Training (CDN) với Attention Mask cách ly nhóm.
 2. Multi-scale Backbone (ResNet-50 hoặc MobileNetV3-Large) + Hybrid Encoder (AIFI + CCFF).
-3. Fine-grained Distribution Refinement (FDR) Head tinh chỉnh tọa độ qua phân phối rời rạc.
-4. Suy luận End-to-End không cần NMS (NMS-Free) & an toàn số học tuyệt đối với AMP FP16.
+3. Fine-grained Distribution Refinement (FDR) Head tinh chỉnh tọa độ qua phân phối rời rạc (FP32 safe).
+4. Suy luận End-to-End NMS-Free & tương thích 100% checkpoint đã huấn luyện.
 """
 
 import math
@@ -194,7 +193,8 @@ class HybridEncoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.aifi = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        # Đặt enable_nested_tensor=False để loại bỏ UserWarning của PyTorch khi norm_first=True
+        self.aifi = nn.TransformerEncoder(encoder_layer, num_layers=1, enable_nested_tensor=False)
 
         self.td_p4 = RepConvBlock(hidden_dim * 2, hidden_dim)
         self.td_p3 = RepConvBlock(hidden_dim * 2, hidden_dim)
@@ -349,7 +349,6 @@ class DFINEDetector(nn.Module):
             for _ in range(num_decoder_layers)
         ])
 
-        # Khởi tạo bias theo chuẩn Focal Loss / D-FINE (prior_prob = 0.01) để tránh sốc Loss Epoch 1
         prior_prob = 0.01
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
         nn.init.constant_(self.enc_score_head.bias, bias_value)
@@ -382,7 +381,6 @@ class DFINEDetector(nn.Module):
         if max_gt == 0 or self.num_dn_groups <= 0:
             return None
 
-        # Mỗi nhóm gồm max_gt positive queries và max_gt negative queries
         num_dn = max_gt * 2 * self.num_dn_groups
         dn_labels = torch.full((batch_size, num_dn), self.num_classes, dtype=torch.long, device=device)
         dn_boxes = torch.full((batch_size, num_dn, 4), 0.5, dtype=torch.float32, device=device)
@@ -395,13 +393,12 @@ class DFINEDetector(nn.Module):
                 continue
 
             gt_labels = t["labels"].to(device)
-            gt_boxes = t["boxes"].float().to(device)  # cx, cy, w, h
+            gt_boxes = t["boxes"].float().to(device)
             pos_indices = []
             gt_indices = []
 
             for g in range(self.num_dn_groups):
                 base = g * (2 * max_gt)
-                # 1. Positive queries: nhiễu nhỏ (±15% kích thước box) -> học kéo box khớp sát nhãn thật
                 noise_pos = (torch.rand_like(gt_boxes) * 2.0 - 1.0) * 0.15
                 pos_b = gt_boxes.clone()
                 pos_b[:, :2] += noise_pos[:, :2] * gt_boxes[:, 2:]
@@ -413,7 +410,6 @@ class DFINEDetector(nn.Module):
                 pos_indices.extend(range(base, base + n_gt))
                 gt_indices.extend(range(n_gt))
 
-                # 2. Negative queries: nhiễu lớn (lệch 50%..100% kích thước box) -> học từ chối hộp lệch
                 neg_base = base + max_gt
                 sign = torch.where(torch.rand_like(gt_boxes) > 0.5, 1.0, -1.0)
                 noise_neg = sign * (0.5 + torch.rand_like(gt_boxes) * 0.5)
@@ -422,7 +418,6 @@ class DFINEDetector(nn.Module):
                 neg_b[:, 2:] *= (1.0 + noise_neg[:, 2:] * 0.5)
                 neg_b = neg_b.clamp(1e-3, 1.0 - 1e-3)
 
-                # Nhãn lớp ngẫu nhiên khác lớp thật hoặc nền
                 dn_labels[b, neg_base:neg_base + n_gt] = gt_labels
                 dn_boxes[b, neg_base:neg_base + n_gt] = neg_b
 
@@ -434,12 +429,9 @@ class DFINEDetector(nn.Module):
         dn_tgt = self.dn_label_embed(dn_labels).to(dtype)
         dn_ref_unsig = torch.log(dn_boxes / (1.0 - dn_boxes)).clamp(-15.0, 15.0)
 
-        # Attention mask: Ngăn matching queries nhìn thấy CDN queries và ngăn các nhóm CDN nhìn lẫn nhau
         total_q = num_dn + self.num_queries
         attn_mask = torch.zeros((total_q, total_q), dtype=torch.bool, device=device)
-        # Matching queries không được nhìn thấy CDN queries
         attn_mask[num_dn:, :num_dn] = True
-        # Các nhóm CDN khác nhau không nhìn thấy nhau
         group_size = 2 * max_gt
         for g in range(self.num_dn_groups):
             s, e = g * group_size, (g + 1) * group_size
@@ -522,10 +514,9 @@ class DFINEDetector(nn.Module):
             out["dn_meta"] = cdn_pack["dn_meta"]
         return out
 
-    # Cập nhật hàm predict() trong class DFINEDetector:
     @torch.inference_mode()
     def predict(self, images: torch.Tensor, score_thresh: float = 0.35, top_k: int | None = None):
-        """Suy luận NMS-Free. Hỗ trợ `top_k` để giới hạn số lượng box trả về trên thiết bị biên."""
+        """Suy luận NMS-Free. Trả về labels 1-indexed (1..num_classes)."""
         _, _, h, w = images.shape
         out = self.forward(images)
         probs = out["pred_logits"].float().sigmoid()
@@ -555,6 +546,7 @@ class DFINEDetector(nn.Module):
                 "labels": b_labels,
             })
         return results
+
 
 class HungarianMatcher(nn.Module):
     """Khớp cặp 1-1 tối ưu toàn cục giữa Q dự đoán và M nhãn thực tế (ổn định FP32)."""
@@ -707,6 +699,7 @@ class DFINECriterion(nn.Module):
                 )
             return total_loss
 
+
 def build_dfine_detector(
     num_classes: int,
     variant: str = "dfine_s",
@@ -716,7 +709,6 @@ def build_dfine_detector(
     """
     Khởi tạo mô hình D-FINE:
     - 'dfine_s': MobileNetV3-Large + 3 decoder layers.
-      Mặc định `num_queries=40` (có thể truyền `num_queries=35` cho Module 1, `num_queries=15` cho Module 2).
     - 'dfine_l': ResNet-50 + 4 decoder layers.
     """
     if variant == "dfine_s":
